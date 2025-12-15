@@ -15,6 +15,7 @@
 #include <X11/Xatom.h>
 #include <X11/extensions/Xfixes.h>
 #include <X11/extensions/shape.h>
+#include <X11/keysym.h>
 
 
 #include <cassert>
@@ -919,9 +920,27 @@ void setup_focus_on_target(X11Context& xc)
     // Give keyboard focus to the source window
     XSetInputFocus(xc.dpy, xc.targetWindow, RevertToParent, CurrentTime);
 }
+
+void grab_toggle_hotkey(X11Context& xc)
+{
+    KeyCode keycode = XKeysymToKeycode(xc.dpy, XK_s);
+    unsigned int modifiers = ControlMask | Mod1Mask; // Ctrl + Alt
+
+    // Grab with and without NumLock / CapsLock
+    const unsigned int locks[] = { 0, LockMask, Mod2Mask, (unsigned)(LockMask | Mod2Mask) };
+
+    for (unsigned int lock : locks) {
+        XGrabKey(xc.dpy, keycode, modifiers | lock, xc.root, False, GrabModeAsync, GrabModeAsync);
+    }
+
+    XSelectInput(xc.dpy, xc.root, KeyPressMask);
+    XFlush(xc.dpy);
+}
+
+
 /* ------------------------------ Cleanup ------------------------------ */
 
-void cleanup(VulkanContext& vc, X11Context& xc, CaptureBuffer& cb)
+void cleanup_session(VulkanContext& vc, X11Context& xc, CaptureBuffer& cb)
 {
     if (vc.device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(vc.device);
@@ -958,13 +977,30 @@ void cleanup(VulkanContext& vc, X11Context& xc, CaptureBuffer& cb)
         xc.vkWindow = 0;
     }
 
+    // IMPORTANT: do NOT XCloseDisplay here.
+}
+
+void cleanup_app(X11Context& xc)
+{
+    if (xc.mainWindow) {
+        XDestroyWindow(xc.dpy, xc.mainWindow);
+        xc.mainWindow = 0;
+    }
     if (xc.dpy) {
         XCloseDisplay(xc.dpy);
         xc.dpy = nullptr;
     }
 }
 
-void main_loop(X11Context& xc)
+static bool is_toggle_hotkey(const XKeyEvent& k)
+{
+    KeySym sym = XLookupKeysym(const_cast<XKeyEvent*>(&k), 0);
+    const unsigned int want = ControlMask | Mod1Mask;
+    return sym == XK_s && (k.state & want) == want;
+}
+
+
+bool run_session(X11Context& xc)
 {
     init_x11_copy(xc);
     VulkanContext vc{};
@@ -980,38 +1016,37 @@ void main_loop(X11Context& xc)
     CaptureBuffer capture{};
 
     bool running = true;
+    bool app_exit = false;
+
     while (running) {
-        // Basic X11 event loop
         while (XPending(xc.dpy)) {
             XEvent ev;
             XNextEvent(xc.dpy, &ev);
+
             switch (ev.type) {
             case DestroyNotify:
+                // If the GUI window gets closed, exit the whole app
+                if (ev.xdestroywindow.window == xc.mainWindow) {
+                    app_exit = true;
+                }
                 running = false;
                 break;
 
-            // case KeyPress:
-            // case KeyRelease:
-            //     forward_key_to_target(xc, &ev.xkey);
-            //     break;
-
-            // case ButtonPress:
-            // case ButtonRelease:
-            //     forward_button_to_target(xc, &ev.xbutton);
-            //     break;
-
-            // case MotionNotify:
-            //     forward_motion_to_target(xc, &ev.xmotion);
-            //     break;
-
-            case ConfigureNotify:
-                recreate_swapchain(vc, xc);
+            case KeyPress:
+                if (is_toggle_hotkey(ev.xkey)) {
+                    running = false; // stop session
+                }
                 break;
 
-            default:
+            case ConfigureNotify:
+                if (ev.xconfigure.window == xc.vkWindow) {
+                    recreate_swapchain(vc, xc); // only when vkWindow changes :contentReference[oaicite:6]{index=6}
+                }
                 break;
             }
         }
+
+        if (!running) break;
 
         update_target_pixmap_if_needed(xc);
 
@@ -1083,16 +1118,40 @@ void main_loop(X11Context& xc)
         }
     }
 
-    cleanup(vc, xc, capture);
+    cleanup_session(vc, xc, capture);
+    return app_exit;
 }
 
 /* ------------------------------ Main ------------------------------ */
 
 int main()
 {
-    sleep(3);
     X11Context xc{};
     init_x11_main(xc);
-    main_loop(xc);
+
+    grab_toggle_hotkey(xc);
+
+    bool app_running = true;
+
+    while (app_running) {
+        XEvent ev;
+        XNextEvent(xc.dpy, &ev); // blocking wait
+
+        if (ev.type == DestroyNotify && ev.xdestroywindow.window == xc.mainWindow) {
+            app_running = false;
+            break;
+        }
+
+        if (ev.type == KeyPress && is_toggle_hotkey(ev.xkey)) {
+            // Start session; it will return when Ctrl+Alt+S is pressed again.
+            fprintf(stderr, "KeyPress received in main loop\n");
+            bool want_exit = run_session(xc);
+            if (want_exit) app_running = false;
+        }
+
+        // handle GUI expose/button/etc here if you want
+    }
+
+    cleanup_app(xc);
     return 0;
 }
