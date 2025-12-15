@@ -1,0 +1,3 @@
+[submodule "libs/FidelityFX-SDK-Linux"]
+	path = libs/FidelityFX-SDK-Linux
+	url = https://github.com/alexghow903/FidelityFX-SDK-Linux
