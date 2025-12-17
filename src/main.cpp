@@ -28,10 +28,13 @@
 #include <iostream>
 #include <algorithm>
 #include <unistd.h>
+#include <chrono>
 
 #include <ffx_api/ffx_api.hpp>
+#include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.hpp>
 #include <ffx_api/vk/ffx_api_vk.hpp>
+#include <ffx_api/ffx_upscale.hpp>
 
 
 static void fatal(const char* msg) {
@@ -214,7 +217,7 @@ void init_x11_copy(X11Context& xc)
     //          StructureNotifyMask);
     XMapWindow(xc.dpy, xc.vkWindow);
     XFlush(xc.dpy);
-    // make_fullscreen(xc);
+    make_fullscreen(xc);
     setup_focus_on_target(xc);
     // int resK = XGrabKeyboard(
     //     xc.dpy,
@@ -282,8 +285,24 @@ struct VulkanContext {
     VkDeviceMemory motionVectorMemory = VK_NULL_HANDLE;
     VkImageView    motionVectorView = VK_NULL_HANDLE;
 
-    // FSR 3 context
-    ffx::Context fsrUpscaleContext{};
+    // Add to VulkanContext (next to your existing images)
+    VkImage        outputColorImage = VK_NULL_HANDLE;
+    VkDeviceMemory outputColorMemory = VK_NULL_HANDLE;
+    VkImageView    outputColorView = VK_NULL_HANDLE;
+
+    VkImage        depthImage = VK_NULL_HANDLE;
+    VkDeviceMemory depthMemory = VK_NULL_HANDLE;
+    VkImageView    depthView = VK_NULL_HANDLE;
+};
+
+struct FSRContext {
+    ffx::CreateBackendVKDesc backendDesc{};
+    ffx::CreateContextDescUpscale createFsr{};
+    ffx::ReturnCode retCodeCreate;
+    ffx::Context m_UpscalingContext = nullptr;
+
+    ffx::DispatchDescUpscale dispatchUpscale{};
+    ffx::ReturnCode retCodeDispatch;
 };
 
 uint32_t findMemoryType(
@@ -382,14 +401,17 @@ void create_device_and_queue(VulkanContext& vc)
     qci.pQueuePriorities = &priority;
 
     const char* extensions[] = {
-        VK_KHR_SWAPCHAIN_EXTENSION_NAME
+        VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+        VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+        VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
+        VK_KHR_BIND_MEMORY_2_EXTENSION_NAME
     };
 
     VkDeviceCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
     ci.queueCreateInfoCount = 1;
     ci.pQueueCreateInfos = &qci;
-    ci.enabledExtensionCount = 1;
+    ci.enabledExtensionCount = 4;
     ci.ppEnabledExtensionNames = extensions;
 
     vk_check(vkCreateDevice(vc.physDevice, &ci, nullptr, &vc.device), "vkCreateDevice");
@@ -660,95 +682,462 @@ void upload_capture_to_staging(
     vkUnmapMemory(vc.device, vc.stagingMemory);
 }
 
+
+// 1. Create an image with memory
+void create_image(
+    VulkanContext& vc,
+    uint32_t width,
+    uint32_t height,
+    VkFormat format,
+    VkImageUsageFlags usage,
+    VkImage& image,
+    VkDeviceMemory& memory)
+{
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = format;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = usage;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    vk_check(vkCreateImage(vc.device, &ici, nullptr, &image), "vkCreateImage");
+
+    VkMemoryRequirements memReq{};
+    vkGetImageMemoryRequirements(vc.device, image, &memReq);
+
+    VkMemoryAllocateInfo mai{};
+    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.allocationSize = memReq.size;
+    mai.memoryTypeIndex = findMemoryType(
+        vc.physDevice,
+        memReq.memoryTypeBits,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT
+    );
+
+    vk_check(vkAllocateMemory(vc.device, &mai, nullptr, &memory), "vkAllocateMemory");
+    vk_check(vkBindImageMemory(vc.device, image, memory, 0), "vkBindImageMemory");
+}
+
+// 2. Create image view
+VkImageView create_image_view(
+    VulkanContext& vc,
+    VkImage image,
+    VkFormat format,
+    VkImageAspectFlags aspectFlags)
+{
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = format;
+    vci.subresourceRange.aspectMask = aspectFlags;
+    vci.subresourceRange.baseMipLevel = 0;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.baseArrayLayer = 0;
+    vci.subresourceRange.layerCount = 1;
+
+    VkImageView view = VK_NULL_HANDLE;
+    vk_check(vkCreateImageView(vc.device, &vci, nullptr, &view), "vkCreateImageView");
+    return view;
+}
+
+// 3. Create all FSR-required images
+void create_fsr_images(VulkanContext& vc)
+{
+    // Input color image (low-res captured content)
+    create_image(
+        vc,
+        vc.renderExtent.width,
+        vc.renderExtent.height,
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        vc.inputColorImage,
+        vc.inputColorMemory
+    );
+    vc.inputColorView = create_image_view(
+        vc, vc.inputColorImage, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    // Output color image (upscaled result)
+    create_image(
+        vc,
+        vc.displayExtent.width,
+        vc.displayExtent.height,
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        vc.outputColorImage,
+        vc.outputColorMemory
+    );
+    vc.outputColorView = create_image_view(
+        vc, vc.outputColorImage, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    // Motion vectors (optional but improves quality)
+    create_image(
+        vc,
+        vc.renderExtent.width,
+        vc.renderExtent.height,
+        VK_FORMAT_R16G16_SFLOAT,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        vc.motionVectorImage,
+        vc.motionVectorMemory
+    );
+    vc.motionVectorView = create_image_view(
+        vc, vc.motionVectorImage, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    // Depth buffer (optional)
+    create_image(
+        vc,
+        vc.renderExtent.width,
+        vc.renderExtent.height,
+        VK_FORMAT_D32_SFLOAT,
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        vc.depthImage,
+        vc.depthMemory
+    );
+    vc.depthView = create_image_view(
+        vc, vc.depthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT
+    );
+}
+
+// 4. Initialize FSR context properly
+void initFSR(VulkanContext& vc, FSRContext& fc) 
+{
+    fc.backendDesc = {};
+    fc.createFsr   = {};
+
+    // IMPORTANT: context must be null on CreateContext
+    fc.m_UpscalingContext = nullptr;
+
+    fc.backendDesc.header.type     = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    fc.backendDesc.vkDevice        = vc.device;
+    fc.backendDesc.vkPhysicalDevice= vc.physDevice;
+    fc.backendDesc.vkDeviceProcAddr= vkGetDeviceProcAddr;
+
+    fc.createFsr.header.type       = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    fc.createFsr.maxUpscaleSize    = { vc.displayExtent.width, vc.displayExtent.height };
+    fc.createFsr.maxRenderSize     = { vc.renderExtent.width,  vc.renderExtent.height  };
+
+    // Highly recommended while bringing it up:
+    fc.createFsr.flags = FFX_UPSCALE_ENABLE_DEBUG_CHECKING; // + whatever else you need
+    // fc.createFsr.fpMessage = &YourFfxMsgCallback;         // to see WHY it fails
+
+    fc.retCodeCreate = ffx::CreateContext(fc.m_UpscalingContext, nullptr, fc.createFsr, fc.backendDesc);
+    if (!fc.retCodeCreate || !fc.m_UpscalingContext) {
+    fprintf(stderr, "CreateContext failed: %d\n", (int)fc.retCodeCreate);
+    return;
+}
+}
+
+// 5. Transition image layout helper
+void transition_image_layout(
+    VkCommandBuffer cmd,
+    VkImage image,
+    VkImageLayout oldLayout,
+    VkImageLayout newLayout,
+    VkImageAspectFlags aspectMask)
+{
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange.aspectMask = aspectMask;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+
+    VkPipelineStageFlags srcStage, dstStage;
+
+    if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && 
+        newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && 
+               newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && 
+               newLayout == VK_IMAGE_LAYOUT_GENERAL) {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    } else {
+        barrier.srcAccessMask = 0;
+        barrier.dstAccessMask = 0;
+        srcStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        dstStage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+
+    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
+// 6. Dispatch FSR upscaling
+static FfxApiSurfaceFormat vk_to_ffx_surface_format(VkFormat fmt) {
+    switch (fmt) {
+        case VK_FORMAT_B8G8R8A8_UNORM:   return FFX_API_SURFACE_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_R16G16_SFLOAT:    return FFX_API_SURFACE_FORMAT_R16G16_FLOAT;
+        case VK_FORMAT_D32_SFLOAT:       return FFX_API_SURFACE_FORMAT_R32_FLOAT; // depth is treated as single-channel float
+        default:                         return FFX_API_SURFACE_FORMAT_UNKNOWN;
+    }
+}
+
+// NOTE: FidelityFX API needs a fully described resource on Vulkan (VkImage doesn't carry format/size at runtime).
+// The Vulkan backend header (ffx_api_vk.hpp/.h) provides the helper function used here.
+// If your SDK version uses a different helper name/signature, adjust ONLY this function.
+static FfxApiResource make_ffx_api_resource_vk(
+    VkImage image,
+    VkImageView imageView,
+    VkFormat format,
+    uint32_t width,
+    uint32_t height,
+    FfxApiResourceState state,
+    const char* name,
+    uint32_t additionalUsages = 0
+) {
+    FfxApiResourceDescription desc{};
+    desc.type     = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+    desc.format   = vk_to_ffx_surface_format(format);
+    desc.width    = width;
+    desc.height   = height;
+    desc.depth    = 1;
+    desc.mipCount = 1;
+    desc.flags    = 0;
+    desc.usage    = additionalUsages;
+
+
+    return ffxApiGetResourceVK(image, desc, state);
+
+}
+
+void dispatch_fsr(VulkanContext& vc, FSRContext& fc, VkCommandBuffer cmd, float jitterX, float jitterY, float deltaTime)
+{
+    if (!fc.m_UpscalingContext) return;
+
+    // Build the dispatch struct described in the FSR3 upscaling docs.
+    // (jitter sign is typically NEGATED vs what you applied to the camera)
+    fc.dispatchUpscale = {}; // reset to defaults each frame
+
+    fc.dispatchUpscale.commandList = cmd;
+
+    // Inputs (render resolution)
+    fc.dispatchUpscale.color = make_ffx_api_resource_vk(
+        vc.inputColorImage, vc.inputColorView, VK_FORMAT_B8G8R8A8_UNORM,
+        vc.renderExtent.width, vc.renderExtent.height,
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
+        "LS_InputColor"
+    );
+
+    fc.dispatchUpscale.depth = make_ffx_api_resource_vk(
+        vc.depthImage, vc.depthView, VK_FORMAT_D32_SFLOAT,
+        vc.renderExtent.width, vc.renderExtent.height,
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
+        "LS_Depth"
+    );
+
+    fc.dispatchUpscale.motionVectors = make_ffx_api_resource_vk(
+        vc.motionVectorImage, vc.motionVectorView, VK_FORMAT_R16G16_SFLOAT,
+        vc.renderExtent.width, vc.renderExtent.height,
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
+        "LS_MotionVectors"
+    );
+
+    // Optional inputs: leave empty unless you generate them
+    fc.dispatchUpscale.exposure                   = {};
+    fc.dispatchUpscale.reactive                   = {};
+    fc.dispatchUpscale.transparencyAndComposition = {};
+
+    // Output (presentation resolution). Mark as UAV-capable if your SDK uses usage flags.
+    fc.dispatchUpscale.output = make_ffx_api_resource_vk(
+        vc.outputColorImage, vc.outputColorView, VK_FORMAT_B8G8R8A8_UNORM,
+        vc.displayExtent.width, vc.displayExtent.height,
+        FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
+        "LS_OutputColor",
+        FFX_API_RESOURCE_USAGE_UAV
+    );
+
+    // Jitter (note the sign convention in the SDK docs)
+    fc.dispatchUpscale.jitterOffset.x = -jitterX;
+    fc.dispatchUpscale.jitterOffset.y = -jitterY;
+
+    // If motion vectors are in pixels, scale is render resolution (as shown in SDK examples)
+    fc.dispatchUpscale.motionVectorScale.x = (float)vc.renderExtent.width;
+    fc.dispatchUpscale.motionVectorScale.y = (float)vc.renderExtent.height;
+
+    fc.dispatchUpscale.renderSize  = { vc.renderExtent.width,  vc.renderExtent.height };
+    fc.dispatchUpscale.upscaleSize = { vc.displayExtent.width, vc.displayExtent.height };
+
+    // Sharpening (optional)
+    fc.dispatchUpscale.enableSharpening = false;
+    fc.dispatchUpscale.sharpness        = 0.0f;
+
+    // SDK expects milliseconds
+    fc.dispatchUpscale.frameTimeDelta = deltaTime * 1000.0f;
+
+    // If you don't have real camera/depth info, these are best-effort placeholders.
+    fc.dispatchUpscale.preExposure             = 1.0f;
+    static bool s_firstFrame = true;
+    fc.dispatchUpscale.reset                   = s_firstFrame;
+    fc.dispatchUpscale.cameraNear              = 0.1f;
+    fc.dispatchUpscale.cameraFar               = 1000.0f;
+    fc.dispatchUpscale.cameraFovAngleVertical  = 1.0f;   // ~57 degrees
+    fc.dispatchUpscale.viewSpaceToMetersFactor = 1.0f;
+    fc.dispatchUpscale.flags                   = 0;
+
+    ffx::ReturnCode rc = ffx::Dispatch(fc.m_UpscalingContext, fc.dispatchUpscale);
+    if (!rc) {
+        fprintf(stderr, "ffx::Dispatch(UPSCALE) failed: %d\n", (int)rc);
+    }
+
+    s_firstFrame = false;
+}
+
+// 7. Cleanup FSR resources
+void cleanup_fsr(VulkanContext& vc, FSRContext& fc)
+{
+    if (fc.m_UpscalingContext) {
+        ffx::DestroyContext(fc.m_UpscalingContext);
+        fc.m_UpscalingContext = nullptr;
+    }
+    
+    if (vc.inputColorView) vkDestroyImageView(vc.device, vc.inputColorView, nullptr);
+    if (vc.inputColorImage) vkDestroyImage(vc.device, vc.inputColorImage, nullptr);
+    if (vc.inputColorMemory) vkFreeMemory(vc.device, vc.inputColorMemory, nullptr);
+    
+    if (vc.outputColorView) vkDestroyImageView(vc.device, vc.outputColorView, nullptr);
+    if (vc.outputColorImage) vkDestroyImage(vc.device, vc.outputColorImage, nullptr);
+    if (vc.outputColorMemory) vkFreeMemory(vc.device, vc.outputColorMemory, nullptr);
+    
+    if (vc.motionVectorView) vkDestroyImageView(vc.device, vc.motionVectorView, nullptr);
+    if (vc.motionVectorImage) vkDestroyImage(vc.device, vc.motionVectorImage, nullptr);
+    if (vc.motionVectorMemory) vkFreeMemory(vc.device, vc.motionVectorMemory, nullptr);
+    
+    if (vc.depthView) vkDestroyImageView(vc.device, vc.depthView, nullptr);
+    if (vc.depthImage) vkDestroyImage(vc.device, vc.depthImage, nullptr);
+    if (vc.depthMemory) vkFreeMemory(vc.device, vc.depthMemory, nullptr);
+}
+
 /* --------- Record copy from staging buffer to swapchain image -------- */
 
-void record_copy_to_swap_image(
+// Replace your record_copy_to_swap_image function with this enhanced version
+void record_upscale_and_present(
     VulkanContext& vc,
-    uint32_t imageIndex)
+    FSRContext& fc,
+    uint32_t imageIndex,
+    float deltaTime,
+    uint32_t frameCount)
 {
     VkCommandBuffer cmd = vc.cmdBuffers[imageIndex];
-
     vk_check(vkResetCommandBuffer(cmd, 0), "vkResetCommandBuffer");
 
     VkCommandBufferBeginInfo bi{};
     bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
     vk_check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
 
-    VkImage swapImg = vc.swapImages[imageIndex];
-
-    // Layout transition: UNDEFINED -> TRANSFER_DST_OPTIMAL
-    VkImageMemoryBarrier toTransfer{};
-    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toTransfer.image = swapImg;
-    toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    toTransfer.subresourceRange.baseMipLevel = 0;
-    toTransfer.subresourceRange.levelCount = 1;
-    toTransfer.subresourceRange.baseArrayLayer = 0;
-    toTransfer.subresourceRange.layerCount = 1;
-    toTransfer.srcAccessMask = 0;
-    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-    vkCmdPipelineBarrier(
-        cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0,
-        0, nullptr,
-        0, nullptr,
-        1, &toTransfer
+    // STEP 1: Copy captured data from staging buffer to inputColorImage
+    transition_image_layout(
+        cmd, vc.inputColorImage,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_ASPECT_COLOR_BIT
     );
 
-    // Copy buffer -> image
-    VkBufferImageCopy region{};
-    region.bufferOffset = 0;
-    region.bufferRowLength = 0;   // tightly packed, use imageExtent.width
-    region.bufferImageHeight = 0; // tightly packed
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageOffset = {0, 0, 0};
-    region.imageExtent = { vc.swapExtent.width, vc.swapExtent.height, 1 };
+    VkBufferImageCopy copyRegion{};
+    copyRegion.bufferOffset = 0;
+    copyRegion.bufferRowLength = 0;
+    copyRegion.bufferImageHeight = 0;
+    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyRegion.imageSubresource.mipLevel = 0;
+    copyRegion.imageSubresource.baseArrayLayer = 0;
+    copyRegion.imageSubresource.layerCount = 1;
+    copyRegion.imageOffset = {0, 0, 0};
+    copyRegion.imageExtent = {vc.renderExtent.width, vc.renderExtent.height, 1};
 
     vkCmdCopyBufferToImage(
         cmd,
         vc.stagingBuffer,
-        swapImg,
+        vc.inputColorImage,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         1,
-        &region
+        &copyRegion
     );
 
-    // Layout transition: TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR
-    VkImageMemoryBarrier toPresent{};
-    toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    toPresent.image = swapImg;
-    toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    toPresent.subresourceRange.baseMipLevel = 0;
-    toPresent.subresourceRange.levelCount = 1;
-    toPresent.subresourceRange.baseArrayLayer = 0;
-    toPresent.subresourceRange.layerCount = 1;
-    toPresent.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toPresent.dstAccessMask = 0;
+    transition_image_layout(
+        cmd, vc.inputColorImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_IMAGE_ASPECT_COLOR_BIT
+    );
 
-    vkCmdPipelineBarrier(
+    // STEP 2: Prepare output image for FSR
+    transition_image_layout(
+        cmd, vc.outputColorImage,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_GENERAL,
+        VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    // STEP 3: Run FSR upscaling
+    // Simple halton sequence for jitter (improves temporal quality)
+    float jitterX = 0.0f, jitterY = 0.0f;
+    if (frameCount % 2 == 0) {
+        jitterX = 0.5f / vc.renderExtent.width;
+        jitterY = 0.5f / vc.renderExtent.height;
+    }
+    
+    dispatch_fsr(vc, fc, cmd, jitterX, jitterY, deltaTime); 
+
+    // STEP 4: Copy upscaled result to swapchain
+    VkImage swapImg = vc.swapImages[imageIndex];
+
+    transition_image_layout(
+        cmd, swapImg,
+        VK_IMAGE_LAYOUT_UNDEFINED,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    VkImageCopy copyToSwap{};
+    copyToSwap.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyToSwap.srcSubresource.mipLevel = 0;
+    copyToSwap.srcSubresource.baseArrayLayer = 0;
+    copyToSwap.srcSubresource.layerCount = 1;
+    copyToSwap.srcOffset = {0, 0, 0};
+    copyToSwap.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copyToSwap.dstSubresource.mipLevel = 0;
+    copyToSwap.dstSubresource.baseArrayLayer = 0;
+    copyToSwap.dstSubresource.layerCount = 1;
+    copyToSwap.dstOffset = {0, 0, 0};
+    copyToSwap.extent = {vc.displayExtent.width, vc.displayExtent.height, 1};
+
+    vkCmdCopyImage(
         cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-        0,
-        0, nullptr,
-        0, nullptr,
-        1, &toPresent
+        vc.outputColorImage, VK_IMAGE_LAYOUT_GENERAL,
+        swapImg, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &copyToSwap
+    );
+
+    transition_image_layout(
+        cmd, swapImg,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+        VK_IMAGE_ASPECT_COLOR_BIT
     );
 
     vk_check(vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
@@ -1008,24 +1397,45 @@ bool run_session(X11Context& xc)
     create_xlib_surface(vc, xc);
     pick_physical_device_and_queue(vc);
     create_device_and_queue(vc);
+    
+    // Set up resolution scaling
+    // For 2x upscaling: render at half resolution, display at full
+    vc.displayExtent.width = xc.width;
+    vc.displayExtent.height = xc.height;
+    vc.renderExtent.width = xc.width / 2;  // Adjust this ratio as needed
+    vc.renderExtent.height = xc.height / 2;
+    
     create_swapchain(vc, xc.width, xc.height);
     create_command_pool_and_buffers(vc);
     create_sync_objects(vc);
     create_staging_buffer(vc);
+    
+    // Create FSR images and initialize
+    create_fsr_images(vc);
+    
+    FSRContext fc{};
+    initFSR(vc, fc);
 
     CaptureBuffer capture{};
 
     bool running = true;
     bool app_exit = false;
+    
+    auto lastTime = std::chrono::high_resolution_clock::now();
+    uint32_t frameCount = 0;
 
     while (running) {
+        // Calculate delta time
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float deltaTime = std::chrono::duration<float>(currentTime - lastTime).count();
+        lastTime = currentTime;
+        
         while (XPending(xc.dpy)) {
             XEvent ev;
             XNextEvent(xc.dpy, &ev);
 
             switch (ev.type) {
             case DestroyNotify:
-                // If the GUI window gets closed, exit the whole app
                 if (ev.xdestroywindow.window == xc.mainWindow) {
                     app_exit = true;
                 }
@@ -1034,13 +1444,24 @@ bool run_session(X11Context& xc)
 
             case KeyPress:
                 if (is_toggle_hotkey(ev.xkey)) {
-                    running = false; // stop session
+                    running = false;
                 }
                 break;
 
             case ConfigureNotify:
                 if (ev.xconfigure.window == xc.vkWindow) {
-                    recreate_swapchain(vc, xc); // only when vkWindow changes :contentReference[oaicite:6]{index=6}
+                    // Need to recreate FSR images too
+                    vkDeviceWaitIdle(vc.device);
+                    cleanup_fsr(vc, fc);
+                    recreate_swapchain(vc, xc);
+                    
+                    vc.displayExtent.width = xc.width;
+                    vc.displayExtent.height = xc.height;
+                    vc.renderExtent.width = xc.width / 2;
+                    vc.renderExtent.height = xc.height / 2;
+                    
+                    create_fsr_images(vc);
+                    initFSR(vc, fc);
                 }
                 break;
             }
@@ -1051,7 +1472,6 @@ bool run_session(X11Context& xc)
         update_target_pixmap_if_needed(xc);
 
         if (!capture_frame(xc, capture)) {
-            // If capture fails, just continue; this may happen if window is minimized, etc.
             continue;
         }
 
@@ -1074,19 +1494,26 @@ bool run_session(X11Context& xc)
         );
 
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR || acquire == VK_SUBOPTIMAL_KHR) {
+            vkDeviceWaitIdle(vc.device);
+            cleanup_fsr(vc, fc);
             recreate_swapchain(vc, xc);
-            // Skip this frame; next loop iteration will use the new swapchain
+            
+            vc.displayExtent.width = xc.width;
+            vc.displayExtent.height = xc.height;
+            vc.renderExtent.width = xc.width / 2;
+            vc.renderExtent.height = xc.height / 2;
+            
+            create_fsr_images(vc);
+            initFSR(vc, fc);
             continue;
         } else if (acquire != VK_SUCCESS) {
-            std::fprintf(stderr,
-                        "vkAcquireNextImageKHR error %d; exiting.\n", acquire);
+            std::fprintf(stderr, "vkAcquireNextImageKHR error %d\n", acquire);
             break;
         }
 
-        record_copy_to_swap_image(vc, imageIndex);
+        record_upscale_and_present(vc, fc, imageIndex, deltaTime, frameCount++);
 
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-
         VkSubmitInfo submit{};
         submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit.waitSemaphoreCount = 1;
@@ -1109,15 +1536,13 @@ bool run_session(X11Context& xc)
 
         VkResult presRes = vkQueuePresentKHR(vc.queue, &present);
         if (presRes == VK_ERROR_OUT_OF_DATE_KHR || presRes == VK_SUBOPTIMAL_KHR) {
-            recreate_swapchain(vc, xc);
-            continue; // next frame will pick up the new swapchain
+            continue;
         } else if (presRes != VK_SUCCESS) {
-            std::fprintf(stderr,
-                        "vkQueuePresentKHR error %d; exiting.\n", presRes);
+            std::fprintf(stderr, "vkQueuePresentKHR error %d\n", presRes);
             break;
         }
     }
-
+    cleanup_fsr(vc, fc);
     cleanup_session(vc, xc, capture);
     return app_exit;
 }
