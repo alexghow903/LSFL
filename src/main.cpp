@@ -144,12 +144,6 @@ Window getFocus(X11Context& xc) {
 
 void init_x11_main(X11Context& xc) 
 {
-    xc.dpy = XOpenDisplay(nullptr);
-    if (!xc.dpy) fatal("XOpenDisplay failed");
-
-    xc.screen = DefaultScreen(xc.dpy);
-    xc.root = RootWindow(xc.dpy, xc.screen);
-
     xc.mainWindow = XCreateSimpleWindow(xc.dpy, xc.root, 0, 0, 400, 300, 0, BlackPixel(xc.dpy, xc.screen), WhitePixel(xc.dpy, xc.screen));
     XSelectInput(xc.dpy, xc.mainWindow, ExposureMask | StructureNotifyMask);
     XMapWindow(xc.dpy, xc.mainWindow);
@@ -1644,6 +1638,11 @@ bool run_session(X11Context& xc)
 int main()
 {
     X11Context xc{};
+    xc.dpy = XOpenDisplay(nullptr);
+    if (!xc.dpy) fatal("XOpenDisplay failed");
+    xc.screen = DefaultScreen(xc.dpy);
+    xc.root = RootWindow(xc.dpy, xc.screen);
+    
     init_x11_main(xc);
 
     grab_toggle_hotkey(xc);
