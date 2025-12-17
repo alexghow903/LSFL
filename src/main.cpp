@@ -59,8 +59,14 @@ struct X11Context {
     Window vkWindow = 0;       // Vulkan-presented window
     Window targetWindow = 0;   // Window we capture
     Pixmap targetPixmap = 0;
-    int width = 0;
-    int height = 0;
+
+    // Capture (source window) size
+    int capW = 0;
+    int capH = 0;
+
+    // Output (fullscreen) size
+    int outW = 0;
+    int outH = 0;
 };
 
 void make_fullscreen(X11Context& xc);
@@ -170,8 +176,12 @@ void init_x11_copy(X11Context& xc)
         fatal("XGetWindowAttributes failed");
     }
 
-    xc.width  = attrs.width;
-    xc.height = attrs.height;
+    xc.capW = attrs.width;
+    xc.capH = attrs.height;
+
+    // Output size (fullscreen)
+    xc.outW = DisplayWidth(xc.dpy, xc.screen);
+    xc.outH = DisplayHeight(xc.dpy, xc.screen);
 
     XCompositeRedirectWindow(xc.dpy, xc.targetWindow, CompositeRedirectAutomatic);
     XSync(xc.dpy, False); // make errors happen here, not later
@@ -192,7 +202,7 @@ void init_x11_copy(X11Context& xc)
 
     xc.vkWindow = XCreateWindow(
         xc.dpy, xc.root,
-        0, 0, xc.width, xc.height,
+        0, 0, xc.outW, xc.outH,
         0,
         CopyFromParent,
         InputOutput,
@@ -274,6 +284,7 @@ struct VulkanContext {
 
     VkExtent2D renderExtent;   // low-res input to FSR
     VkExtent2D displayExtent;  // swapchain / window size
+    VkExtent2D captureExtent{0,0};
 
     // NEW: off-screen input color image at render resolution
     VkImage        inputColorImage = VK_NULL_HANDLE;
@@ -293,6 +304,10 @@ struct VulkanContext {
     VkImage        depthImage = VK_NULL_HANDLE;
     VkDeviceMemory depthMemory = VK_NULL_HANDLE;
     VkImageView    depthView = VK_NULL_HANDLE;
+
+    VkImage        captureColorImage  = VK_NULL_HANDLE;
+    VkDeviceMemory captureColorMemory = VK_NULL_HANDLE;
+    VkImageView    captureColorView = VK_NULL_HANDLE;
 };
 
 struct FSRContext {
@@ -571,7 +586,7 @@ void create_sync_objects(VulkanContext& vc)
 
 void create_staging_buffer(VulkanContext& vc)
 {
-    vc.stagingSize = vc.swapExtent.width * vc.swapExtent.height * 4ull;
+    vc.stagingSize = (VkDeviceSize)vc.captureExtent.width * vc.captureExtent.height * 4ull;
 
     VkBufferCreateInfo bci{};
     bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -625,7 +640,7 @@ bool capture_frame(const X11Context& xc, CaptureBuffer& cb)
         xc.dpy,
         xc.targetPixmap,
         0, 0,
-        xc.width, xc.height,
+        xc.capW, xc.capH,
         AllPlanes,
         ZPixmap
     );
@@ -662,13 +677,15 @@ void upload_capture_to_staging(
     auto* dst = static_cast<std::uint8_t*>(mapped);
     auto* src = reinterpret_cast<std::uint8_t*>(cb.image->data);
 
+    // Clear whole staging to black (prevents garbage borders)
+    std::memset(dst, 0, (size_t)vc.stagingSize);
+
     const int srcStride = cb.image->bytes_per_line;
 
-    // Clamp to whichever is smaller: captured image or swapchain
-    const int width  = std::min<int>(vc.swapExtent.width,  cb.image->width);
-    const int height = std::min<int>(vc.swapExtent.height, cb.image->height);
+    const int width  = std::min<int>((int)vc.captureExtent.width,  cb.image->width);
+    const int height = std::min<int>((int)vc.captureExtent.height, cb.image->height);
 
-    const int dstStride      = static_cast<int>(vc.swapExtent.width) * 4;
+    const int dstStride      = (int)vc.captureExtent.width * 4;
     const int copyWidthBytes = width * 4;
 
     for (int y = 0; y < height; ++y) {
@@ -805,6 +822,16 @@ void create_fsr_images(VulkanContext& vc)
     vc.depthView = create_image_view(
         vc, vc.depthImage, VK_FORMAT_D32_SFLOAT, VK_IMAGE_ASPECT_DEPTH_BIT
     );
+
+    create_image(
+        vc,
+        vc.captureExtent.width,
+        vc.captureExtent.height,
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        vc.captureColorImage,
+        vc.captureColorMemory
+    );
 }
 
 // 4. Initialize FSR context properly
@@ -877,6 +904,26 @@ void transition_image_layout(
         barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
+        newLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    } else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL &&
+            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    } else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
+            newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        srcStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT; // good enough for your pipeline
+        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     } else {
         barrier.srcAccessMask = 0;
         barrier.dstAccessMask = 0;
@@ -1030,6 +1077,11 @@ void cleanup_fsr(VulkanContext& vc, FSRContext& fc)
     if (vc.depthView) vkDestroyImageView(vc.device, vc.depthView, nullptr);
     if (vc.depthImage) vkDestroyImage(vc.device, vc.depthImage, nullptr);
     if (vc.depthMemory) vkFreeMemory(vc.device, vc.depthMemory, nullptr);
+
+    if (vc.captureColorImage)  vkDestroyImage(vc.device, vc.captureColorImage, nullptr);
+    if (vc.captureColorMemory) vkFreeMemory(vc.device, vc.captureColorMemory, nullptr);
+    vc.captureColorImage  = VK_NULL_HANDLE;
+    vc.captureColorMemory = VK_NULL_HANDLE;
 }
 
 /* --------- Record copy from staging buffer to swapchain image -------- */
@@ -1051,33 +1103,77 @@ void record_upscale_and_present(
     vk_check(vkBeginCommandBuffer(cmd, &bi), "vkBeginCommandBuffer");
 
     // STEP 1: Copy captured data from staging buffer to inputColorImage
+    VkImageLayout capOld = (frameCount == 0)
+        ? VK_IMAGE_LAYOUT_UNDEFINED
+        : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
     transition_image_layout(
-        cmd, vc.inputColorImage,
-        VK_IMAGE_LAYOUT_UNDEFINED,
+        cmd, vc.captureColorImage,
+        capOld,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         VK_IMAGE_ASPECT_COLOR_BIT
     );
 
-    VkBufferImageCopy copyRegion{};
-    copyRegion.bufferOffset = 0;
-    copyRegion.bufferRowLength = 0;
-    copyRegion.bufferImageHeight = 0;
-    copyRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copyRegion.imageSubresource.mipLevel = 0;
-    copyRegion.imageSubresource.baseArrayLayer = 0;
-    copyRegion.imageSubresource.layerCount = 1;
-    copyRegion.imageOffset = {0, 0, 0};
-    copyRegion.imageExtent = {vc.renderExtent.width, vc.renderExtent.height, 1};
+    // IMPORTANT: your staging rows are packed as swapExtent.width * 4 bytes per row
+    // (see upload_capture_to_staging: dstStride = vc.swapExtent.width * 4) :contentReference[oaicite:6]{index=6}
+    VkBufferImageCopy capCopy{};
+    capCopy.bufferOffset = 0;
+    capCopy.bufferRowLength   = vc.captureExtent.width;
+    capCopy.bufferImageHeight = vc.captureExtent.height;
+    capCopy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    capCopy.imageSubresource.mipLevel = 0;
+    capCopy.imageSubresource.baseArrayLayer = 0;
+    capCopy.imageSubresource.layerCount = 1;
+    capCopy.imageOffset = {0, 0, 0};
+    capCopy.imageExtent = { vc.captureExtent.width, vc.captureExtent.height, 1 };
 
     vkCmdCopyBufferToImage(
         cmd,
         vc.stagingBuffer,
-        vc.inputColorImage,
+        vc.captureColorImage,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         1,
-        &copyRegion
+        &capCopy
     );
 
+    transition_image_layout(
+        cmd, vc.captureColorImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    // --- Prepare low-res inputColorImage as blit destination ---
+    VkImageLayout inOld = (frameCount == 0)
+        ? VK_IMAGE_LAYOUT_UNDEFINED
+        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    transition_image_layout(
+        cmd, vc.inputColorImage,
+        inOld,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_ASPECT_COLOR_BIT
+    );
+
+    // --- Blit (scale) full-res capture -> low-res input ---
+    VkImageBlit blit{};
+    blit.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.srcOffsets[0]  = { 0, 0, 0 };
+    blit.srcOffsets[1] =  { (int)vc.captureExtent.width, (int)vc.captureExtent.height, 1 };
+
+    blit.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    blit.dstOffsets[0]  = { 0, 0, 0 };
+    blit.dstOffsets[1]  = { (int)vc.renderExtent.width, (int)vc.renderExtent.height, 1 };
+
+    vkCmdBlitImage(
+        cmd,
+        vc.captureColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        vc.inputColorImage,   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &blit,
+        VK_FILTER_NEAREST
+    );
+
+    // --- Input is now ready for FSR sampling ---
     transition_image_layout(
         cmd, vc.inputColorImage,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -1178,11 +1274,11 @@ void recreate_swapchain(VulkanContext& vc, X11Context& xc)
     if (!XGetWindowAttributes(xc.dpy, xc.vkWindow, &attrs)) {
         fatal("XGetWindowAttributes failed in recreate_swapchain");
     }
-    xc.width  = attrs.width;
-    xc.height = attrs.height;
+    xc.outW  = attrs.width;
+    xc.outH = attrs.height;
 
     // Rebuild swapchain + dependent resources at new size
-    create_swapchain(vc, xc.width, xc.height);     // updates vc.swapExtent
+    create_swapchain(vc, xc.outW, xc.outH);     // updates vc.swapExtent
     create_command_pool_and_buffers(vc);
     create_staging_buffer(vc);
 }
@@ -1199,15 +1295,15 @@ void update_target_pixmap_if_needed(X11Context& xc)
     int newH = attrs.height;
 
     // No change – nothing to do
-    if (newW == xc.width && newH == xc.height) {
+    if (newW == xc.capW && newH == xc.capH) {
         return;
     }
 
     std::printf("Source window resized: %dx%d -> %dx%d\n",
-                xc.width, xc.height, newW, newH);
+                xc.capW, xc.capH, newW, newH);
 
-    xc.width  = newW;
-    xc.height = newH;
+    xc.capW = newW;
+    xc.capH = newH;
 
     // Drop the old named pixmap (it will no longer be updated by the server)
     if (xc.targetPixmap) {
@@ -1398,14 +1494,14 @@ bool run_session(X11Context& xc)
     pick_physical_device_and_queue(vc);
     create_device_and_queue(vc);
     
-    // Set up resolution scaling
-    // For 2x upscaling: render at half resolution, display at full
-    vc.displayExtent.width = xc.width;
-    vc.displayExtent.height = xc.height;
-    vc.renderExtent.width = xc.width / 2;  // Adjust this ratio as needed
-    vc.renderExtent.height = xc.height / 2;
+    vc.captureExtent = { (uint32_t)xc.capW, (uint32_t)xc.capH };
+    vc.displayExtent = { (uint32_t)xc.outW, (uint32_t)xc.outH };
+
+    // Lossless path: render at capture res (no half-res)
+    vc.renderExtent = vc.captureExtent;
     
-    create_swapchain(vc, xc.width, xc.height);
+    create_swapchain(vc, (int)vc.displayExtent.width, (int)vc.displayExtent.height);
+    vc.displayExtent = vc.swapExtent;
     create_command_pool_and_buffers(vc);
     create_sync_objects(vc);
     create_staging_buffer(vc);
@@ -1455,10 +1551,8 @@ bool run_session(X11Context& xc)
                     cleanup_fsr(vc, fc);
                     recreate_swapchain(vc, xc);
                     
-                    vc.displayExtent.width = xc.width;
-                    vc.displayExtent.height = xc.height;
-                    vc.renderExtent.width = xc.width / 2;
-                    vc.renderExtent.height = xc.height / 2;
+                    vc.displayExtent = { (uint32_t)xc.outW, (uint32_t)xc.outH };
+                    vc.renderExtent  = vc.captureExtent; // lossless
                     
                     create_fsr_images(vc);
                     initFSR(vc, fc);
@@ -1498,10 +1592,8 @@ bool run_session(X11Context& xc)
             cleanup_fsr(vc, fc);
             recreate_swapchain(vc, xc);
             
-            vc.displayExtent.width = xc.width;
-            vc.displayExtent.height = xc.height;
-            vc.renderExtent.width = xc.width / 2;
-            vc.renderExtent.height = xc.height / 2;
+            vc.displayExtent = { (uint32_t)xc.outW, (uint32_t)xc.outH };
+            vc.renderExtent  = vc.captureExtent; // lossless
             
             create_fsr_images(vc);
             initFSR(vc, fc);
