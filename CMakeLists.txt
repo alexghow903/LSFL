@@ -29,7 +29,7 @@ target_include_directories(amd_fidelityfx_vk INTERFACE "${CMAKE_SOURCE_DIR}/libs
 target_link_libraries(${PROJECT_NAME} PRIVATE
     ${X11_LIBRARIES}
     ${X11_Xcomposite_LIB}
-    Xtst
+    # Xtst
     # Xshape
     Xfixes
     Vulkan::Vulkan
